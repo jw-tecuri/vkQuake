@@ -13,6 +13,7 @@ import json
 import os
 import plistlib
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,50 @@ def is_macho(path):
     except subprocess.CalledProcessError:
         return False
     return "Mach-O" in out
+
+
+def fix_linkedit_filesize(path):
+    """Shrink a stale __LINKEDIT filesize so install_name_tool will accept the file.
+
+    codesign --remove-signature truncates the code-signature blob but, on some
+    Homebrew arm64 binaries (SDL3), leaves LC_SEGMENT_64 filesize pointing past
+    EOF. install_name_tool then reports that link-edit information does not
+    fill the __LINKEDIT segment.
+    """
+    with open(path, "rb") as fh:
+        data = bytearray(fh.read())
+    if len(data) < 32:
+        return False
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != 0xFEEDFACF:  # MH_MAGIC_64
+        return False
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    offset = 32
+    file_size = len(data)
+    changed = False
+    for _ in range(ncmds):
+        if offset + 8 > file_size:
+            break
+        cmd, cmdsize = struct.unpack_from("<II", data, offset)
+        if cmdsize < 8 or offset + cmdsize > file_size:
+            break
+        if cmd == 0x19 and cmdsize >= 72:  # LC_SEGMENT_64
+            segname = bytes(data[offset + 8 : offset + 24]).split(b"\x00", 1)[0]
+            if segname == b"__LINKEDIT":
+                fileoff, filesize = struct.unpack_from("<QQ", data, offset + 40)
+                if fileoff > file_size:
+                    break
+                actual = file_size - fileoff
+                if filesize != actual:
+                    struct.pack_into("<Q", data, offset + 48, actual)
+                    changed = True
+                break
+        offset += cmdsize
+    if changed:
+        with open(path, "wb") as fh:
+            fh.write(data)
+        print(f"adjusted __LINKEDIT filesize in {path}", flush=True)
+    return changed
 
 
 def is_system(dep):
@@ -306,7 +351,10 @@ class Bundler:
 
     def _rewrite_one(self, path):
         # Ad-hoc linker signatures block install_name_tool on modern macOS.
+        # Removing one can leave __LINKEDIT.filesize past EOF; repair that
+        # before rewriting install names.
         subprocess.call(["codesign", "--remove-signature", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        fix_linkedit_filesize(path)
         ident = dylib_id(path)
         original_ident = ident
         if ident and not is_system(ident) and not os.path.samefile(path, self.exe):
