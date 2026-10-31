@@ -141,15 +141,103 @@ def framework_root(path):
 
 
 def ensure_arm64(path):
+    """Keep a single thin arm64 Mach-O.
+
+    `lipo -archs` prints only "arm64" for both a thin file and a one-slice fat
+    file. Homebrew's SDL3 bottle is the latter, and install_name_tool rejects
+    it after the code signature is removed. Always extract the arm64 slice.
+    """
     archs = capture(["lipo", "-archs", path]).strip().split()
-    if archs == ["arm64"]:
-        return
     if "arm64" not in archs:
         raise SystemExit(f"{path} is not arm64 (lipo -archs: {' '.join(archs)})")
     tmp = path + ".arm64"
     run(["lipo", path, "-thin", "arm64", "-output", tmp])
     os.replace(tmp, path)
     os.chmod(path, 0o755)
+
+
+class MachOEditor:
+    """Rewrite install names inside a thin little-endian Mach-O.
+
+    Load-command strings are overwritten in place when the new path fits in
+    the existing command. That avoids install_name_tool, which rejects some
+    Homebrew binaries whose __LINKEDIT no longer matches the file size.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as fh:
+            self.data = bytearray(fh.read())
+        magic = struct.unpack_from("<I", self.data, 0)[0]
+        if magic != 0xFEEDFACF:
+            raise SystemExit(f"{path} is not a thin little-endian Mach-O (magic {magic:#x})")
+        self.ncmds = struct.unpack_from("<I", self.data, 16)[0]
+
+    def commands(self):
+        offset = 32
+        for _ in range(self.ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", self.data, offset)
+            if cmdsize < 8 or offset + cmdsize > len(self.data):
+                raise SystemExit(f"bad load command in {self.path}")
+            yield offset, cmd, cmdsize
+            offset += cmdsize
+
+    def _read_string(self, offset, cmdsize):
+        name_off = struct.unpack_from("<I", self.data, offset + 8)[0]
+        if name_off < 8 or name_off >= cmdsize:
+            raise SystemExit(f"bad string offset in {self.path}")
+        start = offset + name_off
+        end = offset + cmdsize
+        raw = bytes(self.data[start:end])
+        nul = raw.find(b"\x00")
+        if nul < 0:
+            raise SystemExit(f"unterminated load-command string in {self.path}")
+        return raw[:nul].decode(), start, end
+
+    def _write_string(self, start, end, new):
+        encoded = new.encode() + b"\x00"
+        if len(encoded) > end - start:
+            return False
+        self.data[start : start + len(encoded)] = encoded
+        for index in range(start + len(encoded), end):
+            self.data[index] = 0
+        return True
+
+    def set_id(self, new):
+        for offset, cmd, cmdsize in self.commands():
+            if (cmd & ~0x80000000) != 0xD:  # LC_ID_DYLIB
+                continue
+            _old, start, end = self._read_string(offset, cmdsize)
+            return self._write_string(start, end, new)
+        return True
+
+    def change(self, old, new):
+        found = False
+        for offset, cmd, cmdsize in self.commands():
+            if (cmd & ~0x80000000) not in (0xC, 0xD, 0x18, 0x1F, 0x23):
+                continue
+            name, start, end = self._read_string(offset, cmdsize)
+            if name != old:
+                continue
+            found = True
+            if name != new and not self._write_string(start, end, new):
+                return False
+        return found
+
+    def neutralize_rpaths(self):
+        for offset, cmd, cmdsize in self.commands():
+            if (cmd & ~0x80000000) != 0x1C:  # LC_RPATH
+                continue
+            name, start, end = self._read_string(offset, cmdsize)
+            if not (name.startswith(FORBIDDEN_PREFIXES) or "/opt/homebrew" in name or "/usr/local" in name):
+                continue
+            if not self._write_string(start, end, "@loader_path"):
+                return False
+        return True
+
+    def save(self):
+        with open(self.path, "wb") as fh:
+            fh.write(self.data)
 
 
 def resolve_dep(dep, loader, exe_dir):
@@ -350,29 +438,56 @@ class Bundler:
             )
 
     def _rewrite_one(self, path):
+        if os.path.samefile(path, self.exe):
+            # The executable's new paths are longer than the Homebrew ids, so
+            # they need the header pad added at link time.
+            self._rewrite_with_install_name_tool(path)
+        else:
+            self._rewrite_inplace(path)
+
+    def _rewrite_inplace(self, path):
+        ident = dylib_id(path)
+        editor = MachOEditor(path)
+        if ident and self._forbidden_path(ident):
+            base = os.path.basename(path)
+            if not any(editor.set_id(cand) for cand in ("@loader_path/" + base, "@rpath/" + base)):
+                raise SystemExit(f"no room to set id of {path} away from {ident}")
+        seen = set()
+        for dep in otool_deps(path):
+            if ident and dep == ident:
+                continue
+            bundled = self.dep_to_rel.get(dep)
+            if bundled is None or dep in seen:
+                continue
+            seen.add(dep)
+            new = self._new_ref(path, bundled)
+            alt = "@rpath/" + os.path.basename(bundled)
+            if dep != new and not editor.change(dep, new) and not editor.change(dep, alt):
+                raise SystemExit(f"no room to retarget {dep} -> {new} in {path}")
+        if not editor.neutralize_rpaths():
+            raise SystemExit(f"no room to rewrite rpaths in {path}")
+        editor.save()
+        print(f"rewrote install names in {path}", flush=True)
+
+    @staticmethod
+    def _forbidden_path(name):
+        return name.startswith(FORBIDDEN_PREFIXES) or "/opt/homebrew" in name or "/usr/local" in name
+
+    def _rewrite_with_install_name_tool(self, path):
         # Ad-hoc linker signatures block install_name_tool on modern macOS.
         # Removing one can leave __LINKEDIT.filesize past EOF; repair that
         # before rewriting install names.
         subprocess.call(["codesign", "--remove-signature", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         fix_linkedit_filesize(path)
         ident = dylib_id(path)
-        original_ident = ident
-        if ident and not is_system(ident) and not os.path.samefile(path, self.exe):
-            rel = os.path.relpath(os.path.realpath(path), os.path.realpath(self.frameworks))
-            if os.sep in rel:
-                new_id = "@rpath/" + rel.replace(os.sep, "/")
-            else:
-                new_id = "@loader_path/" + rel
-            if ident != new_id:
-                self._install_name(["install_name_tool", "-id", new_id, path])
         seen_changes = set()
         for dep in otool_deps(path):
-            if original_ident and dep == original_ident:
+            if ident and dep == ident:
                 continue
-            rel = self.dep_to_rel.get(dep)
-            if rel is None or dep in seen_changes:
+            bundled = self.dep_to_rel.get(dep)
+            if bundled is None or dep in seen_changes:
                 continue
-            new = self._new_ref(path, rel)
+            new = self._new_ref(path, bundled)
             seen_changes.add(dep)
             if dep != new:
                 self._install_name(["install_name_tool", "-change", dep, new, path])
