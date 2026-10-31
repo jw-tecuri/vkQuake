@@ -1,0 +1,191 @@
+name: macOS arm64 release
+
+# Native Apple Silicon vkQuake.app from upstream tag 1.37.0 (current checkout
+# if that tag cannot be fetched). A push to the default branch only builds.
+# Pushing a tag v*-macos-arm64 publishes a GitHub release on this fork:
+# tags containing "-test" are pre-releases, every other match is a normal
+# release marked latest. Does not upload anything to Novum/vkQuake.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*-macos-arm64"
+      - "v*-macos-arm64-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: Build vkQuake.app (arm64)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          eval "$(brew shellenv)"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          # MoltenVK is linked directly (the 1.37.0 Meson build does not use
+          # the Vulkan loader on Darwin). vulkan-headers supplies vulkan.h.
+          brew install molten-vk vulkan-headers glslang spirv-tools sdl2 sdl3 libvorbis flac opus opusfile mpg123 meson pkgconf ninja
+          brew list --versions molten-vk vulkan-headers glslang spirv-tools sdl2 sdl3 libvorbis flac opus opusfile mpg123 meson pkgconf ninja
+
+      - name: Fetch vkQuake 1.37.0 sources
+        id: src
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/src"
+          tag=1.37.0
+          fork_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          upstream_url="https://github.com/Novum/vkQuake.git"
+          if git ls-remote --tags "$fork_url" "refs/tags/${tag}" | grep -q "refs/tags/${tag}$"; then
+            git clone --depth 1 --branch "$tag" "$fork_url" "$RUNNER_TEMP/src"
+            echo "desc=fork tag ${tag}" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git -C "$RUNNER_TEMP/src" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --tags "$upstream_url" "refs/tags/${tag}" | grep -q "refs/tags/${tag}$"; then
+            git clone --depth 1 --branch "$tag" "$upstream_url" "$RUNNER_TEMP/src"
+            echo "desc=upstream tag ${tag}" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git -C "$RUNNER_TEMP/src" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${tag} is not on this fork or Novum/vkQuake; building the checked-out commit."
+            mkdir -p "$RUNNER_TEMP/src"
+            tar -C "$GITHUB_WORKSPACE" --exclude .git --exclude dist -cf - . | tar -x -C "$RUNNER_TEMP/src"
+            echo "desc=checked-out commit (tag ${tag} absent)" >> "$GITHUB_OUTPUT"
+            echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+          grep -n "VKQUAKE_VER" "$RUNNER_TEMP/src/Quake/quakever.h" | head -20
+
+      - name: Build with Meson
+        run: |
+          set -euo pipefail
+          eval "$(brew shellenv)"
+          if ! command -v glslangValidator >/dev/null 2>&1 && command -v glslang >/dev/null 2>&1; then
+            ln -s "$(command -v glslang)" "$(brew --prefix)/bin/glslangValidator"
+          fi
+          command -v glslangValidator
+          command -v spirv-opt
+          cd "$RUNNER_TEMP/src"
+          export MACOSX_DEPLOYMENT_TARGET=13.0
+          export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          Path(os.environ["RUNNER_TEMP"], "macos-arm64.ini").write_text(
+              "[built-in options]\n"
+              "c_args = ['-mmacosx-version-min=13.0', '-I/opt/homebrew/include']\n"
+              "c_link_args = ['-Wl,-headerpad_max_install_names', '-L/opt/homebrew/lib']\n"
+          )
+          PY
+          meson setup build \
+            --native-file "$RUNNER_TEMP/macos-arm64.ini" \
+            --buildtype=release \
+            -Ddebug=false \
+            -Dstrip=true \
+            -Duse_sdl3=enabled \
+            -Duse_codec_wave=enabled \
+            -Duse_codec_mp3=enabled \
+            -Duse_codec_flac=enabled \
+            -Duse_codec_vorbis=enabled \
+            -Duse_codec_opus=enabled
+          meson compile -C build -j 3
+          file build/vkquake
+          lipo -archs build/vkquake
+          otool -L build/vkquake
+
+      - name: Package app, DMG, and zip
+        run: |
+          set -euo pipefail
+          python3 Packaging/macos/package_app.py \
+            --binary "$RUNNER_TEMP/src/build/vkquake" \
+            --source "$RUNNER_TEMP/src" \
+            --output dist \
+            --version 1.37.0
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          dmg=vkQuake-1.37.0-macos-arm64.dmg
+          zip=vkQuake-1.37.0-macos-arm64.zip
+          test -f "$dmg"
+          test -f "$zip"
+          sha_dmg=$(shasum -a 256 "$dmg" | awk '{print $1}')
+          sha_zip=$(shasum -a 256 "$zip" | awk '{print $1}')
+          {
+            echo "${sha_dmg}  ${dmg}"
+            echo "${sha_zip}  ${zip}"
+          } > SHA256SUMS
+          minos=$(cat minos.txt)
+          tag="${GITHUB_REF_NAME}"
+          title="vkQuake 1.37.0 for macOS (Apple Silicon)"
+          if [[ "$tag" == *"-test"* ]]; then
+            title="${title} (test)"
+            release_flags=(--prerelease)
+          else
+            release_flags=(--latest)
+          fi
+          {
+            echo "Unofficial native arm64 build of upstream vkQuake 1.37.0 (commit 749b4fd) from the jw-tecuri fork."
+            echo
+            echo "This is not an official Novum/vkQuake release. MoltenVK is bundled inside the app. The app is ad-hoc signed and **not notarized**. The first time you open it, use right-click → Open (or clear quarantine with \`xattr -dr com.apple.quarantine vkQuake.app\`)."
+            echo
+            echo "Requires macOS 15+ (bundled binaries declare a minimum of ${minos})."
+            echo
+            echo "No Quake game data is included. On macOS the default basedir is the folder that contains \`vkQuake.app\`. Place \`id1/pak0.pak\` next to the app, or pass \`-basedir\` pointing at the folder that contains \`id1\`."
+            echo
+            echo "Built from ${{ steps.src.outputs.desc }} (\`${{ steps.src.outputs.sha }}\`) with Meson on a macos-15 arm64 runner."
+            echo
+            echo "## Verification"
+            echo
+            echo "This release was published only after CI passed all of the following on the built app and on the copy mounted from the DMG:"
+            echo
+            echo "- \`lipo -archs\` is \`arm64\` for every Mach-O file"
+            echo "- \`otool -L\` and load commands contain no \`/opt/homebrew\` or \`/usr/local\` references"
+            echo "- no dangling symlinks in the bundle"
+            echo "- \`codesign --verify --deep --strict --verbose=2\` succeeds (ad-hoc signature, inside-out)"
+            echo "- smoke test of the absolute binary path with \`-dedicated\` and an empty \`-basedir\` (no display, no game data) exits non-zero and mentions \`pak0.pak\`"
+            echo
+            echo "## SHA-256"
+            echo
+            echo "- \`${dmg}\`: \`${sha_dmg}\`"
+            echo "- \`${zip}\`: \`${sha_zip}\`"
+            echo
+            echo "\`SHA256SUMS\` is attached to this release."
+          } > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" "$zip" SHA256SUMS --clobber
+            if [[ "$tag" == *"-test"* ]]; then
+              gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
+            else
+              gh release edit "$tag" --latest --title "$title" --notes-file notes.md
+            fi
+          else
+            gh release create "$tag" "$dmg" "$zip" SHA256SUMS \
+              "${release_flags[@]}" \
+              --title "$title" \
+              --notes-file notes.md
+          fi
+          gh release view "$tag" --json url,tagName,isPrerelease,assets --jq '{url:.url,tag:.tagName,prerelease:.isPrerelease,assets:[.assets[].name]}'
+
+      - name: Upload dist artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vkQuake-macos-arm64
+          if-no-files-found: ignore
+          path: |
+            dist/**
