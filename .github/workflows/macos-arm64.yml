@@ -119,7 +119,7 @@ jobs:
             --version 1.37.0
 
       - name: Publish release
-        if: github.ref_type == 'tag' || inputs.publish_tag != ''
+        if: github.ref_type == 'tag' || inputs.publish_tag != '' || (github.event_name == 'push' && github.ref == 'refs/heads/master' && contains(github.event.head_commit.message, '[publish-macos-arm64]'))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -136,10 +136,12 @@ jobs:
             echo "${sha_zip}  ${zip}"
           } > SHA256SUMS
           minos=$(cat minos.txt)
-          if [[ -n "${{ inputs.publish_tag }}" ]]; then
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.publish_tag }}" ]]; then
             tag="${{ inputs.publish_tag }}"
           else
-            tag="${GITHUB_REF_NAME}"
+            tag="v1.37.0-macos-arm64"
           fi
           title="vkQuake 1.37.0 for macOS (Apple Silicon)"
           if [[ "$tag" == *"-test"* ]]; then
