@@ -144,12 +144,15 @@ def ensure_arm64(path):
     """Keep a single thin arm64 Mach-O.
 
     `lipo -archs` prints only "arm64" for both a thin file and a one-slice fat
-    file. Homebrew's SDL3 bottle is the latter, and install_name_tool rejects
-    it after the code signature is removed. Always extract the arm64 slice.
+    file. `lipo -thin` rejects an already-thin file, so only extract a slice
+    when lipo reports a fat file.
     """
     archs = capture(["lipo", "-archs", path]).strip().split()
     if "arm64" not in archs:
         raise SystemExit(f"{path} is not arm64 (lipo -archs: {' '.join(archs)})")
+    info = capture(["lipo", "-info", path])
+    if "Non-fat" in info:
+        return
     tmp = path + ".arm64"
     run(["lipo", path, "-thin", "arm64", "-output", tmp])
     os.replace(tmp, path)
