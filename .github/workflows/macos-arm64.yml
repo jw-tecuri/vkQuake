@@ -8,6 +8,12 @@ name: macOS arm64 release
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: Existing tag to publish (for example v1.37.0-macos-arm64). Leave empty to build only.
+        required: false
+        default: ""
+        type: string
   push:
     branches:
       - master
@@ -113,7 +119,7 @@ jobs:
             --version 1.37.0
 
       - name: Publish release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.publish_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -130,7 +136,11 @@ jobs:
             echo "${sha_zip}  ${zip}"
           } > SHA256SUMS
           minos=$(cat minos.txt)
-          tag="${GITHUB_REF_NAME}"
+          if [[ -n "${{ inputs.publish_tag }}" ]]; then
+            tag="${{ inputs.publish_tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
           title="vkQuake 1.37.0 for macOS (Apple Silicon)"
           if [[ "$tag" == *"-test"* ]]; then
             title="${title} (test)"
@@ -166,8 +176,11 @@ jobs:
             echo
             echo "\`SHA256SUMS\` is attached to this release."
           } > notes.md
+          # Other tag workflows may have opened a draft release for this tag.
+          # A draft cannot be marked latest, so publish it before --latest.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$dmg" "$zip" SHA256SUMS --clobber
+            gh release edit "$tag" --draft=false --title "$title" --notes-file notes.md
             if [[ "$tag" == *"-test"* ]]; then
               gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
             else
