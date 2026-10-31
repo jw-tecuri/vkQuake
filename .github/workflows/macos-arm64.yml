@@ -1,14 +1,19 @@
 name: macOS arm64 release
 
 # Native Apple Silicon vkQuake.app from upstream tag 1.37.0 (current checkout
-# if that tag cannot be fetched). Publishes an unofficial ad-hoc signed
-# pre-release. Does not upload anything to Novum/vkQuake.
+# if that tag cannot be fetched). A push to the default branch only builds.
+# Pushing a tag v*-macos-arm64 publishes a GitHub release on this fork:
+# tags containing "-test" are pre-releases, every other match is a normal
+# release marked latest. Does not upload anything to Novum/vkQuake.
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - cursor/macos-arm64-release-f764
+      - master
+    tags:
+      - "v*-macos-arm64"
+      - "v*-macos-arm64-*"
 
 permissions:
   contents: write
@@ -107,7 +112,8 @@ jobs:
             --output dist \
             --version 1.37.0
 
-      - name: Publish pre-release
+      - name: Publish release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -119,44 +125,57 @@ jobs:
           test -f "$zip"
           sha_dmg=$(shasum -a 256 "$dmg" | awk '{print $1}')
           sha_zip=$(shasum -a 256 "$zip" | awk '{print $1}')
-          minos=$(cat minos.txt)
           {
-            echo "Unofficial macOS Apple Silicon (arm64) build of vkQuake 1.37.0."
+            echo "${sha_dmg}  ${dmg}"
+            echo "${sha_zip}  ${zip}"
+          } > SHA256SUMS
+          minos=$(cat minos.txt)
+          tag="${GITHUB_REF_NAME}"
+          title="vkQuake 1.37.0 for macOS (Apple Silicon)"
+          if [[ "$tag" == *"-test"* ]]; then
+            title="${title} (test)"
+            release_flags=(--prerelease)
+          else
+            release_flags=(--latest)
+          fi
+          {
+            echo "Unofficial native arm64 build of upstream vkQuake 1.37.0 (commit 749b4fd) from the jw-tecuri fork."
             echo
-            echo "This is not an official Novum/vkQuake release. The app is ad-hoc signed (\`codesign --sign -\`) and is **not notarized**. macOS Gatekeeper will refuse a normal double-click until the app is opened via Right Click → Open, or until quarantine is cleared (\`xattr -dr com.apple.quarantine vkQuake.app\`)."
+            echo "This is not an official Novum/vkQuake release. MoltenVK is bundled inside the app. The app is ad-hoc signed and **not notarized**. The first time you open it, use right-click → Open (or clear quarantine with \`xattr -dr com.apple.quarantine vkQuake.app\`)."
             echo
-            echo "Built from ${{ steps.src.outputs.desc }} (\`${{ steps.src.outputs.sha }}\`) with the project's Meson build on a \`macos-15\` arm64 runner. MoltenVK is linked directly and copied into \`vkQuake.app/Contents/Frameworks\` with the other non-system libraries. No Quake game data is included."
+            echo "Requires macOS 15+ (bundled binaries declare a minimum of ${minos})."
             echo
-            echo "## Game data"
+            echo "No Quake game data is included. On macOS the default basedir is the folder that contains \`vkQuake.app\`. Place \`id1/pak0.pak\` next to the app, or pass \`-basedir\` pointing at the folder that contains \`id1\`."
             echo
-            echo "On macOS the default basedir is the directory that **contains** \`vkQuake.app\`. The engine resolves \`argv[0]\`, and if that path is inside an \`.app/Contents/MacOS\` bundle it strips the bundle and uses the parent folder. Put \`id1\` next to the app (or pass \`-basedir\`):"
+            echo "Built from ${{ steps.src.outputs.desc }} (\`${{ steps.src.outputs.sha }}\`) with Meson on a macos-15 arm64 runner."
             echo
-            echo "\`\`\`"
-            echo "Quake/"
-            echo "  vkQuake.app"
-            echo "  id1/"
-            echo "    pak0.pak"
-            echo "    pak1.pak"
-            echo "\`\`\`"
+            echo "## Verification"
             echo
-            echo "Dragging the app onto \`/Applications\` still looks for \`/Applications/id1\`. A dedicated folder, or \`-basedir /path/to/quake\` (the folder that contains \`id1\`), is the practical setup. Saves and config are written in that basedir (\`do_userdirs\` is off in this build)."
+            echo "This release was published only after CI passed all of the following on the built app and on the copy mounted from the DMG:"
             echo
-            echo "Minimum OS (from the bundled Mach-O load commands, and at least macOS 13): ${minos}"
+            echo "- \`lipo -archs\` is \`arm64\` for every Mach-O file"
+            echo "- \`otool -L\` and load commands contain no \`/opt/homebrew\` or \`/usr/local\` references"
+            echo "- no dangling symlinks in the bundle"
+            echo "- \`codesign --verify --deep --strict --verbose=2\` succeeds (ad-hoc signature, inside-out)"
+            echo "- smoke test of the absolute binary path with \`-dedicated\` and an empty \`-basedir\` (no display, no game data) exits non-zero and mentions \`pak0.pak\`"
             echo
             echo "## SHA-256"
             echo
             echo "- \`${dmg}\`: \`${sha_dmg}\`"
             echo "- \`${zip}\`: \`${sha_zip}\`"
+            echo
+            echo "\`SHA256SUMS\` is attached to this release."
           } > notes.md
-          tag=v1.37.0-arm64-test1
-          title="vkQuake 1.37.0 macOS arm64 (unofficial)"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$dmg" "$zip" --clobber
-            gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
+            gh release upload "$tag" "$dmg" "$zip" SHA256SUMS --clobber
+            if [[ "$tag" == *"-test"* ]]; then
+              gh release edit "$tag" --prerelease --title "$title" --notes-file notes.md
+            else
+              gh release edit "$tag" --latest --title "$title" --notes-file notes.md
+            fi
           else
-            gh release create "$tag" "$dmg" "$zip" \
-              --prerelease \
-              --target "${GITHUB_SHA}" \
+            gh release create "$tag" "$dmg" "$zip" SHA256SUMS \
+              "${release_flags[@]}" \
               --title "$title" \
               --notes-file notes.md
           fi
